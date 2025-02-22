@@ -6,7 +6,6 @@ import time
 ####################### API ############################
 ########################################################
 class ApiException(Exception):
-    """Custom Exception for API Errors"""
     pass
 
 API_KEY = {'X-API-Key': 'QDSFW62B'}
@@ -25,21 +24,19 @@ signal.signal(signal.SIGINT, signal_handler)
 #################################### INFO ######################################
 ################################################################################
 def get_tick(session):
-    """Fetch the current case tick"""
     resp = session.get('http://localhost:9999/v1/case')
     if not resp.ok:
         raise ApiException("Failed to fetch current tick")
     return resp.json()['tick']
 
 def get_tenders(session):
-    """Fetch active tender offers"""
     resp = session.get('http://localhost:9999/v1/tenders')
     if not resp.ok:
         raise ApiException("Failed to fetch tenders")
     return resp.json()
 
 def get_order_book(session, ticker):
-    """Fetch order book for a given ticker from both markets and compute VWAP"""
+    """Fetch order book for a ticker from both markets and compute VWAP"""
     book_main = session.get(f'http://localhost:9999/v1/securities/book', params={'ticker': ticker.replace("_A", "_M")}).json()
     book_alt = session.get(f'http://localhost:9999/v1/securities/book', params={'ticker': ticker.replace("_M", "_A")}).json()
 
@@ -60,7 +57,6 @@ def get_order_book(session, ticker):
     return best_bid_m, best_ask_m, best_bid_a, best_ask_a, bid_volume_m + bid_volume_a, ask_volume_m + ask_volume_a, vwap_bid, vwap_ask
 
 def get_inventory(session, ticker):
-    """Fetch current inventory position for a given ticker"""
     resp = session.get('http://localhost:9999/v1/securities')
     if not resp.ok:
         raise ApiException(f"Failed to fetch inventory for {ticker}")
@@ -69,7 +65,6 @@ def get_inventory(session, ticker):
     for security in securities:
         if security['ticker'] == ticker:
             return security['position']
-    print(f"Warning: {ticker} not found in securities list. Returning 0.")
     return 0
 ################################################################################
 
@@ -104,7 +99,7 @@ def decline_tender(session, tender):
     print(f"Declined Tender {tender_id}: {ticker} {action} @ {price}")
 
 
-def evaluate_tender(session, tender, max_attempts=5):
+def evaluate_tender(session, tender, max_attempts=6):
     """Continuously evaluates a tender until it's accepted or declined."""
     ticker = tender['ticker']
     tender_price = tender['price']
@@ -114,14 +109,14 @@ def evaluate_tender(session, tender, max_attempts=5):
     threshold = 0.15
 
     while attempts < max_attempts:
-        time.sleep(4)  # Wait before checking again
+        time.sleep(4)  # delay between evaluation
 
         _, _, _, _, bid_volume, ask_volume, vwap_bid, vwap_ask = get_order_book(session, ticker)
 
-        if action == "BUY" and tender_price < vwap_bid + threshold and bid_volume * 1.25 > ask_volume:
+        if action == "BUY" and tender_price < vwap_bid + threshold and bid_volume * 1.2 > ask_volume:
             accept_tender(session, tender)
             break
-        elif action == "SELL" and tender_price > vwap_ask - threshold and ask_volume * 1.25 > bid_volume:
+        elif action == "SELL" and tender_price > vwap_ask - threshold and ask_volume * 1.2 > bid_volume:
             accept_tender(session, tender)
             break
         
@@ -131,7 +126,7 @@ def evaluate_tender(session, tender, max_attempts=5):
     if attempts == max_attempts:  
         decline_tender(session, tender)
 
-    time.sleep(1.5)
+    time.sleep(2)
     place_aggressive_limit_orders(session, ticker, get_inventory(session, ticker))
 ##################################################################################
 
@@ -154,7 +149,7 @@ def submit_limit_order(session, ticker, quantity, price, action):
     print(f"Placed {action} LIMIT order: {quantity} @ {price} on {ticker}")
 
 def submit_market_order(session, ticker, quantity, action):
-    """Submit multiple market orders if quantity > 10,000"""
+    """Submit a market order"""
     while quantity > 0:
         order_size = min(10000, quantity)
         order = {
@@ -180,7 +175,7 @@ def place_aggressive_limit_orders(session, ticker, inventory):
     book_alt = session.get(f'http://localhost:9999/v1/securities/book', params={'ticker': ticker.replace("_M", "_A")}).json()
 
     remaining_quantity = abs(inventory)
-    alt_orders_placed = 0  # To track alternate exchange order count
+    alt_orders_placed = 0
 
     if inventory < 0:  # Buying
         ask_orders_main = book_main['asks'] if book_main['asks'] else []
@@ -188,24 +183,26 @@ def place_aggressive_limit_orders(session, ticker, inventory):
 
         for ask in ask_orders_main + ask_orders_alt:
             if remaining_quantity <= 0:
-                break  # Stop once all inventory is handled
+                break 
 
-            price = ask['price'] - 0.01  # Slightly aggressive
-            order_size = min(remaining_quantity, ask['quantity'])  # Match each order individually
+            # match each order individually
+            price = ask['price'] - 0.005
+            order_size = min(remaining_quantity, ask['quantity'])
 
             # Choose market dynamically
             destination = "M" if ask in ask_orders_main else "A"
             if destination == "A" and alt_orders_placed >= 10:
-                continue  # Skip ALT if already 10 orders placed
+                continue  # Skip A if already 10 orders placed
 
             ticker = f"{ticker[0:4]}_{destination}"
             submit_limit_order(session, ticker, order_size, price, "BUY")
             
             remaining_quantity -= order_size
             if destination == "A":
-                alt_orders_placed += 1  # Track ALT orders
+                alt_orders_placed += 1  # Track alternate exchange orders
 
-            time.sleep(0.2)  # Small delay for execution handling
+            # delay for orders
+            time.sleep(0.15)
 
     else:  # Selling
         bid_orders_main = book_main['bids'] if book_main['bids'] else []
@@ -213,24 +210,25 @@ def place_aggressive_limit_orders(session, ticker, inventory):
 
         for bid in bid_orders_main + bid_orders_alt:
             if remaining_quantity <= 0:
-                break  # Stop once all inventory is handled
+                break  
 
-            price = bid['price'] + 0.01  # Slightly aggressive
-            order_size = min(remaining_quantity, bid['quantity'])  # Match each order individually
+            price = bid['price'] + 0.005
+            order_size = min(remaining_quantity, bid['quantity']) 
 
             # Choose market dynamically
             destination = "M" if bid in bid_orders_main else "A"
             if destination == "A" and alt_orders_placed >= 10:
-                continue  # Skip ALT if already 10 orders placed
+                continue # Skip A if already 10 orders placed
 
             ticker = f"{ticker[0:4]}_{destination}"
             submit_limit_order(session, ticker, order_size, price, "SELL")
             
             remaining_quantity -= order_size
             if destination == "A":
-                alt_orders_placed += 1  # Track ALT orders
+                alt_orders_placed += 1  # Track alternate exchange orders
 
-            time.sleep(0.2)  # Small delay for execution handling
+            # delay for orders
+            time.sleep(0.15)
 ##################################################################################
 
 ##################################################################################
@@ -238,11 +236,12 @@ def place_aggressive_limit_orders(session, ticker, inventory):
 ##################################################################################
 def close_positions(session):
     """Final liquidation of any remaining inventory before trading ends."""
-    print("Closing all positions before trading ends.")
     securities = ["CRZY_M", "CRZY_A", "TAME_M", "TAME_A"]
     for ticker in securities:
         inventory = get_inventory(session, ticker)
         if inventory != 0:
+            print("Closing all positions before trading ends.")
+
             action = "SELL" if inventory > 0 else "BUY"
             best_bid_m, best_ask_m, best_bid_a, best_ask_a, _, _, _, _ = get_order_book(session, ticker)
 
@@ -262,7 +261,6 @@ def close_positions(session):
 ################################### MAIN LOOP ####################################
 ##################################################################################
 def main():
-    """Main function to manage tenders and liquidation strategy"""
     with requests.Session() as session:
         session.headers.update(API_KEY)
 
