@@ -18,24 +18,22 @@ shutdown = False
 ###############################################################################
 
 # General
-orderslimit     = 8
-ordersize       = 4000
-rebalancesize   = 500
-rebalance_limit = 4000 
+orderslimit = 8
+ordersize   = 4000
 
 # Short-term trend detection
-WINDOW_SIZE = 10
+WINDOW_SIZE          = 10
 TREND_UP_THRESHOLD   = 0.03
 TREND_DOWN_THRESHOLD = -0.03
 
-# Adaptive improvement
-IMPROVE_AMOUNT     = 0.01
-MIN_SPREAD_REQUIRED = 0.03
-
 # NBBO-based dynamic speedbump
-NBBO_WINDOW      = 5       
-HIGH_NBBO_CHANGE = 0.03    
-LOW_NBBO_CHANGE  = 0.01    
+NBBO_WINDOW      = 5 
+LOW_NBBO_CHANGE  = 0.01       
+HIGH_NBBO_CHANGE = 0.03   
+
+# Adaptive improvement
+IMPROVE_AMOUNT      = 0.01
+MIN_SPREAD_REQUIRED = 0.03
 
 ###############################################################################
 
@@ -46,6 +44,8 @@ LOW_NBBO_CHANGE  = 0.01
 starttime = 0
 endtime   = 300
 POSITION_LIMIT = 25000
+rebalancesize   = 500
+rebalance_limit = 4000
 BASE_SPEEDBUMP = 0.2
 MID_PRICE_WINDOW = []
 NBBO_MOVES = []
@@ -182,7 +182,7 @@ def main():
 
         while tick < endtime and not shutdown:
 
-            # 1) Get NBBO + Book (and detect naive spoofing)
+            # 1) Get NBBO + Book (and detect spoofing)
             best_bid, best_ask, book = ticker_bid_ask(s, ticker_sym)
             detect_spoofing(book, tick)
 
@@ -204,7 +204,7 @@ def main():
                 avg_nbbo_move = 0.0
 
             if avg_nbbo_move > HIGH_NBBO_CHANGE:
-                dynamic_speedbump = BASE_SPEEDBUMP * 2.0
+                dynamic_speedbump = BASE_SPEEDBUMP * 1.5
             elif avg_nbbo_move < LOW_NBBO_CHANGE:
                 dynamic_speedbump = BASE_SPEEDBUMP * 0.5
             else:
