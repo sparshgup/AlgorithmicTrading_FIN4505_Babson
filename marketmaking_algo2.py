@@ -18,7 +18,7 @@ shutdown = False
 ###############################################################################
 
 # General
-orderslimit = 8
+orderslimit = 6
 ordersize   = 4000
 
 # Short-term trend detection
@@ -43,7 +43,7 @@ MIN_SPREAD_REQUIRED = 0.03
 ###############################################################################
 starttime = 0
 endtime   = 300
-POSITION_LIMIT = 25000
+POSITION_LIMIT = 24000
 rebalancesize   = 500
 rebalance_limit = 4000
 BASE_SPEEDBUMP = 0.2
