@@ -122,7 +122,7 @@ last_top_bid_qty       = None
 last_top_ask_qty       = None
 spoof_events           = [] 
 spoof_suspect_count    = 0
-CHANNEL_STUFF_THRESHOLD = 300
+CHANNEL_STUFF_THRESHOLD = 500
 
 def detect_spoofing(book, tick):
     """
