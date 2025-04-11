@@ -20,16 +20,14 @@ shutdown = False
 # General
 orderslimit = 6
 ordersize   = 4000
+# 0.2 for 100% and 0.1 for 200%
+BASE_SPEEDBUMP = 0.1
 
 # Short-term trend detection
 WINDOW_SIZE          = 10
 TREND_UP_THRESHOLD   = 0.03
 TREND_DOWN_THRESHOLD = -0.03
-
-# NBBO-based dynamic speedbump
-NBBO_WINDOW      = 5 
-LOW_NBBO_CHANGE  = 0.01       
-HIGH_NBBO_CHANGE = 0.03   
+TREND_VALUE = 0.0075
 
 # Adaptive improvement
 IMPROVE_AMOUNT      = 0.01
@@ -46,9 +44,7 @@ endtime   = 300
 POSITION_LIMIT = 24000
 rebalancesize   = 500
 rebalance_limit = 4000
-BASE_SPEEDBUMP = 0.2
 MID_PRICE_WINDOW = []
-NBBO_MOVES = []
 prev_best_bid = None
 prev_best_ask = None
 ###############################################################################
@@ -111,63 +107,6 @@ def flatten_excess_position(session, ticker_sym, position):
         
 ###############################################################################
 
-
-###############################################################################
-# Algorithmic warfare prevention
-###############################################################################
-
-SPOOF_SIZE_THRESHOLD   = 20000
-SPOOF_DISAPPEAR_TICKS  = 2  
-last_top_bid_qty       = None
-last_top_ask_qty       = None
-spoof_events           = [] 
-spoof_suspect_count    = 0
-CHANNEL_STUFF_THRESHOLD = 500
-
-def detect_spoofing(book, tick):
-    """
-    If best bid or ask jumps by > SPOOF_SIZE_THRESHOLD from last iteration,
-    record an event. If that size disappears within SPOOF_DISAPPEAR_TICKS, 
-    increment suspect count.
-    """
-    global last_top_bid_qty, last_top_ask_qty, spoof_suspect_count
-
-    top_bid_qty = book['bids'][0]['quantity']
-    top_ask_qty = book['asks'][0]['quantity']
-
-    # Check for big jump
-    if last_top_bid_qty is not None and (top_bid_qty - last_top_bid_qty > SPOOF_SIZE_THRESHOLD):
-        spoof_events.append({'tick': tick, 'side': 'BID', 'qty': top_bid_qty})
-    if last_top_ask_qty is not None and (top_ask_qty - last_top_ask_qty > SPOOF_SIZE_THRESHOLD):
-        spoof_events.append({'tick': tick, 'side': 'ASK', 'qty': top_ask_qty})
-
-    # Check if these events vanished
-    remove_list = []
-    for evt in spoof_events:
-        if tick - evt['tick'] >= SPOOF_DISAPPEAR_TICKS:
-            # see if it vanished
-            if evt['side'] == 'BID':
-                if top_bid_qty < evt['qty'] / 2:
-                    spoof_suspect_count += 1
-            else:
-                if top_ask_qty < evt['qty'] / 2:
-                    spoof_suspect_count += 1
-            remove_list.append(evt)
-
-    for evt in remove_list:
-        spoof_events.remove(evt)
-
-    last_top_bid_qty = top_bid_qty
-    last_top_ask_qty = top_ask_qty
-
-def detect_channel_stuffing(total_open):
-    """
-    If total open orders exceed threshold, suspect channel stuffing.
-    """
-    return (total_open > CHANNEL_STUFF_THRESHOLD)
-###############################################################################
-
-
 ###############################################################################
 # Algorithm
 ###############################################################################
@@ -182,33 +121,8 @@ def main():
 
         while tick < endtime and not shutdown:
 
-            # 1) Get NBBO + Book (and detect spoofing)
+            # 1) Get NBBO + Book
             best_bid, best_ask, book = ticker_bid_ask(s, ticker_sym)
-            detect_spoofing(book, tick)
-
-            # 2) NBBO dynamic speedbump
-            if prev_best_bid is not None and prev_best_ask is not None:
-                bid_diff = abs(best_bid - prev_best_bid)
-                ask_diff = abs(best_ask - prev_best_ask)
-                nbbo_move = bid_diff + ask_diff
-                NBBO_MOVES.append(nbbo_move)
-                if len(NBBO_MOVES) > NBBO_WINDOW:
-                    NBBO_MOVES.pop(0)
-
-            prev_best_bid = best_bid
-            prev_best_ask = best_ask
-
-            if NBBO_MOVES:
-                avg_nbbo_move = sum(NBBO_MOVES) / len(NBBO_MOVES)
-            else:
-                avg_nbbo_move = 0.0
-
-            if avg_nbbo_move > HIGH_NBBO_CHANGE:
-                dynamic_speedbump = BASE_SPEEDBUMP * 1.5
-            elif avg_nbbo_move < LOW_NBBO_CHANGE:
-                dynamic_speedbump = BASE_SPEEDBUMP * 0.5
-            else:
-                dynamic_speedbump = BASE_SPEEDBUMP
 
             # 3) Position & short-term trend
             position = get_position(s, ticker_sym)
@@ -226,9 +140,9 @@ def main():
 
             price_adjustment = 0.0
             if slope > TREND_UP_THRESHOLD:
-                price_adjustment = +0.0075
+                price_adjustment = +TREND_VALUE
             elif slope < TREND_DOWN_THRESHOLD:
-                price_adjustment = -0.0075
+                price_adjustment = -TREND_VALUE
 
             # 4) Rebalance logic for normal size
             buy_quantity = ordersize
@@ -246,13 +160,6 @@ def main():
             else:
                 buy_price  = best_bid + price_adjustment
                 sell_price = best_ask + price_adjustment
-
-            # if we've had multiple spoof suspects, widen quotes
-            global spoof_suspect_count
-            if spoof_suspect_count > 3:
-                buy_price  -= 0.02
-                sell_price += 0.02
-                spoof_suspect_count = 0  # reset
 
             # place single buy+sell limit if not crossing
             if buy_price < sell_price:
@@ -272,22 +179,16 @@ def main():
             # 6) Flatten if we've gone above the POSITION_LIMIT
             flatten_excess_position(s, ticker_sym, position)
 
-            # 7) Channel stuffing detection
-            open_orders = get_orders(s, 'OPEN')
-            total_open_orders = len(open_orders)
-            if total_open_orders > CHANNEL_STUFF_THRESHOLD:
-                # if suspected, slow down further
-                dynamic_speedbump *= 1.5
-
             # 8) Cleanup if orders exceed 'orderslimit'
+            open_orders = get_orders(s, 'OPEN')
             while len(open_orders) > orderslimit:
                 orderid = open_orders[-1]['order_id']
                 s.delete(f'http://localhost:9999/v1/orders/{orderid}')
-                sleep(dynamic_speedbump)
+                sleep(BASE_SPEEDBUMP)
                 open_orders = get_orders(s, 'OPEN')
 
             # 9) Sleep dynamic speedbump
-            sleep(dynamic_speedbump)
+            sleep(BASE_SPEEDBUMP)
 
 ###############################################################################
 

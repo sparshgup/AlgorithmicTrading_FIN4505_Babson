@@ -10,231 +10,279 @@ def signal_handler(signum, frame):
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     shutdown = True
 
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
 API_KEY = {'X-API-Key': 'QDSFW62B'}
-shutdown = False
+
+# Overall time constraint
+ENDTIME = 300 
+BASE_SPEEDBUMP = 0.1
+
+# Global position limit: 25k
+GLOBAL_POSITION_LIMIT = 25000
+
+# Keep track of rolling mid-prices per ticker
+MID_PRICE_WINDOWS = {
+    'CNR': [],
+    'RY': [],
+    'AC': []
+}
+
+TICKER_CONFIG = {
+    'CNR': {
+        'WINDOW_SIZE': 10,
+        'TREND_UP_THRESHOLD':  0.20,
+        'TREND_DOWN_THRESHOLD': -0.20,
+        'TREND_VALUE': 0.05,        
+        'ORDER_SIZE':  3000, 
+        'REB_SIZE':    500,       
+        'REB_LIMIT':   3000,     
+        'MIN_SPREAD':  0.20,
+        'IMPROVE':     0.02
+    },
+    'RY': {
+        'WINDOW_SIZE': 10,
+        'TREND_UP_THRESHOLD':  0.10,
+        'TREND_DOWN_THRESHOLD': -0.10,
+        'TREND_VALUE': 0.03,
+        'ORDER_SIZE':  800, 
+        'REB_SIZE':    400,
+        'REB_LIMIT':   2500,
+        'MIN_SPREAD':  0.10,
+        'IMPROVE':     0.01
+    },
+    'AC': {
+        'WINDOW_SIZE': 10,
+        'TREND_UP_THRESHOLD':  0.15,
+        'TREND_DOWN_THRESHOLD': -0.15,
+        'TREND_VALUE': 0.04,
+        'ORDER_SIZE':  1200, 
+        'REB_SIZE':    600,
+        'REB_LIMIT':   4000,
+        'MIN_SPREAD':  0.10,
+        'IMPROVE':     0.02
+    }
+}
 
 ###############################################################################
-# PARAMETERS
+# Helper Functions
 ###############################################################################
 
-TICKERS = ["CNR", "RY", "AC"]
+def get_tick(session):
+    """Fetch the current time/tick in the simulation."""
+    resp = session.get('http://localhost:9999/v1/case')
+    if not resp.ok:
+        raise ApiException("Error in get_tick()")
+    return resp.json()['tick']
 
-# General
-starttime           = 0
-endtime             = 300
-BASE_SPEEDBUMP      = 0.2
-orderslimit         = 8
-ordersize           = 4000
-rebalancesize       = 500
-rebalance_limit     = 4000
-POSITION_LIMIT      = 25000
-
-# Short-term trend detection
-WINDOW_SIZE          = 10
-TREND_UP_THRESHOLD   = 0.03
-TREND_DOWN_THRESHOLD = -0.03
-
-# Adaptive improvement
-IMPROVE_AMOUNT       = 0.01
-MIN_SPREAD_REQUIRED  = 0.03
-
-# NBBO-based dynamic speedbump
-NBBO_WINDOW      = 5       
-HIGH_NBBO_CHANGE = 0.03    
-LOW_NBBO_CHANGE  = 0.01    
-
-# Rolling mid-price windows for slope detection, keyed by ticker
-MID_PRICE_WINDOW = {ticker: [] for ticker in TICKERS}
-
-# Rolling NBBO moves for dynamic speedbump, keyed by ticker
-NBBO_MOVES       = {ticker: [] for ticker in TICKERS}
-
-# Track previous best bid/ask for each ticker
-prev_best_bid    = {ticker: None for ticker in TICKERS}
-prev_best_ask    = {ticker: None for ticker in TICKERS}
-
-###############################################################################
-# Helper functions
-###############################################################################
-
-def get_position(session, ticker):
+def get_positions(session):
+    """
+    Returns a dict of { 'CNR': int_position, 'RY': int_position, 'AC': int_position } 
+    by querying the /securities endpoint. 
+    """
     resp = session.get('http://localhost:9999/v1/securities')
     if not resp.ok:
-        raise ApiException("Error getting securities info")
+        raise ApiException("Could not get securities info")
     data = resp.json()
+
+    pos_dict = {}
     for sec in data:
-        if sec['ticker'] == ticker:
-            return sec['position']
-    return 0
+        tkr = sec['ticker']
+        if tkr in ['CNR', 'RY', 'AC']:
+            pos_dict[tkr] = sec['position']
+    return pos_dict
+
+def total_gross_position(positions):
+    """
+    Sum of absolute values for each ticker's position. 
+    E.g. if we want 'gross' across all 3. 
+    If you're using net, you might do abs(sum(positions.values())) instead.
+    """
+    return abs(positions['CNR']) + abs(positions['RY']) + abs(positions['AC'])
 
 def ticker_bid_ask(session, ticker):
     """
-    Returns (best_bid, best_ask) for a given ticker.
+    Returns best_bid, best_ask, entire_book for the given ticker.
     """
-    payload = {'ticker': ticker}
-    resp = session.get('http://localhost:9999/v1/securities/book', params=payload)
+    resp = session.get('http://localhost:9999/v1/securities/book', params={'ticker': ticker})
     if not resp.ok:
         raise ApiException(f"Error getting book for {ticker}")
     book = resp.json()
-    best_bid = book['bids'][0]['price']
-    best_ask = book['asks'][0]['price']
-    return best_bid, best_ask
+    best_bid = book['bids'][0]['price'] if book['bids'] else None
+    best_ask = book['asks'][0]['price'] if book['asks'] else None
+    return best_bid, best_ask, book
 
-def get_tick(session):
-    resp = session.get('http://localhost:9999/v1/case')
-    if resp.status_code == 401:
-        raise ApiException("Response error in get_tick")
-    return resp.json()['tick']
-
-def get_orders(session, status):
-    payload = {'status': status}
-    resp = session.get('http://localhost:9999/v1/orders', params=payload)
+def get_orders(session, status='OPEN'):
+    """Returns all orders with a given status."""
+    resp = session.get('http://localhost:9999/v1/orders', params={'status': status})
     if not resp.ok:
-        raise ApiException("Error getting orders")
+        raise ApiException("Error getting orders list")
     return resp.json()
 
-def flatten_excess_position(session, ticker, position):
+def flatten_if_exceeded(session, positions):
     """
-    If position > POSITION_LIMIT, or position < -POSITION_LIMIT,
-    flatten the excess with a MARKET order.
+    If our total position is beyond the global limit, we flatten 
+    or partially flatten across tickers as needed. 
+    Since ALGO2e typically rejects trades that would break the limit, 
+    this might be mostly defensive. 
     """
-    if position > POSITION_LIMIT:
-        excess = position - POSITION_LIMIT
+    gross = total_gross_position(positions)
+    if gross <= GLOBAL_POSITION_LIMIT:
+        return  # No action needed
+
+    # If we do exceed, we can systematically flatten from the largest absolute position down.
+    # Sort tickers by who is biggest in absolute position and flatten with a MARKET order.
+    # This code snippet *immediately* tries to reduce the largest position first.
+    sorted_by_abs = sorted(positions.items(), key=lambda x: abs(x[1]), reverse=True)
+    for ticker, pos in sorted_by_abs:
+        if abs(pos) == 0:
+            continue
+        # Example: If pos > 0, sell 'pos' shares; if pos < 0, buy abs(pos) shares
+        action = 'SELL' if pos > 0 else 'BUY'
+        qty = abs(pos)
+
+        # Only flatten enough to get below the limit
+        # e.g. if gross=26000, we only need to flatten 1000 shares in total. 
+        # We'll do it from the largest position first. 
+        amount_over = gross - GLOBAL_POSITION_LIMIT
+        to_flatten = min(qty, amount_over)
+        if to_flatten <= 0:
+            continue
+
         session.post('http://localhost:9999/v1/orders',
-                     params={'ticker': ticker,
-                             'type': 'MARKET',
-                             'quantity': excess,
-                             'action': 'SELL'})
-    elif position < -POSITION_LIMIT:
-        excess = abs(position) - POSITION_LIMIT
-        session.post('http://localhost:9999/v1/orders',
-                     params={'ticker': ticker,
-                             'type': 'MARKET',
-                             'quantity': excess,
-                             'action': 'BUY'})
+                     params={
+                         'ticker': ticker,
+                         'type': 'MARKET',
+                         'quantity': to_flatten,
+                         'action': action
+                     })
+        sleep(BASE_SPEEDBUMP)  # small pause
+        # Re-check positions
+        new_positions = get_positions(session)
+        gross = total_gross_position(new_positions)
+        if gross <= GLOBAL_POSITION_LIMIT:
+            return
 
 ###############################################################################
 # Main Algorithm
 ###############################################################################
 
 def main():
+    global shutdown
+    shutdown = False
+    signal.signal(signal.SIGINT, signal_handler)
+
     with requests.Session() as s:
         s.headers.update(API_KEY)
 
         tick = get_tick(s)
+        while tick < ENDTIME and not shutdown:
+            positions = get_positions(s)
+            flatten_if_exceeded(s, positions)  # just in case
 
-        # Run until endtime
-        while tick < endtime and not shutdown:
-            # We'll keep a global dynamic speedbump (just pick the max 
-            # or average across all tickers) or just pick the min for demonstration.
-            # Example: We'll use the maximum for a "worst-case" speedbump 
-            # (meaning if any ticker is moving a lot, we slow down).
-            all_speedbumps = []
+            # Loop over each ticker we care about
+            for ticker, cfg in TICKER_CONFIG.items():
+                best_bid, best_ask, _ = ticker_bid_ask(s, ticker)
+                if not best_bid or not best_ask:
+                    # If book is empty, skip
+                    continue
 
-            for ticker in TICKERS:
-                best_bid, best_ask = ticker_bid_ask(s, ticker)
-                cur_position = get_position(s, ticker)
+                # 1) Update rolling mid price
+                mid_price = (best_bid + best_ask) / 2
+                MID_PRICE_WINDOWS[ticker].append(mid_price)
+                if len(MID_PRICE_WINDOWS[ticker]) > cfg['WINDOW_SIZE']:
+                    MID_PRICE_WINDOWS[ticker].pop(0)
 
-                # 1) NBBO-based dynamic speedbump for this ticker
-                # track how much the NBBO changed from last time
-                if prev_best_bid[ticker] is not None and prev_best_ask[ticker] is not None:
-                    bid_diff = abs(best_bid - prev_best_bid[ticker])
-                    ask_diff = abs(best_ask - prev_best_ask[ticker])
-                    nbbo_move = bid_diff + ask_diff
-                    NBBO_MOVES[ticker].append(nbbo_move)
-                    if len(NBBO_MOVES[ticker]) > NBBO_WINDOW:
-                        NBBO_MOVES[ticker].pop(0)
-                
-                prev_best_bid[ticker] = best_bid
-                prev_best_ask[ticker] = best_ask
-
-                if NBBO_MOVES[ticker]:
-                    avg_nbbo_move = sum(NBBO_MOVES[ticker]) / len(NBBO_MOVES[ticker])
-                else:
-                    avg_nbbo_move = 0.0
-
-                if avg_nbbo_move > HIGH_NBBO_CHANGE:
-                    ticker_speedbump = BASE_SPEEDBUMP * 2.0
-                elif avg_nbbo_move < LOW_NBBO_CHANGE:
-                    ticker_speedbump = BASE_SPEEDBUMP * 0.5
-                else:
-                    ticker_speedbump = BASE_SPEEDBUMP
-
-                all_speedbumps.append(ticker_speedbump)
-
-                # 2) Short-term slope detection 
-                mid_price = (best_bid + best_ask) / 2.0
-                MID_PRICE_WINDOW[ticker].append(mid_price)
-                if len(MID_PRICE_WINDOW[ticker]) > WINDOW_SIZE:
-                    MID_PRICE_WINDOW[ticker].pop(0)
-
+                # 2) Calculate slope if window is full
                 slope = 0.0
-                if len(MID_PRICE_WINDOW[ticker]) == WINDOW_SIZE:
-                    oldest_mid = MID_PRICE_WINDOW[ticker][0]
-                    newest_mid = MID_PRICE_WINDOW[ticker][-1]
-                    slope = (newest_mid - oldest_mid) / WINDOW_SIZE
+                window_len = len(MID_PRICE_WINDOWS[ticker])
+                if window_len == cfg['WINDOW_SIZE']:
+                    oldest = MID_PRICE_WINDOWS[ticker][0]
+                    newest = MID_PRICE_WINDOWS[ticker][-1]
+                    slope = (newest - oldest) / cfg['WINDOW_SIZE']
 
-                price_adjustment = 0.0
-                if slope > TREND_UP_THRESHOLD:
-                    price_adjustment = +0.01
-                elif slope < TREND_DOWN_THRESHOLD:
-                    price_adjustment = -0.01
+                # 3) Trend-based price adjustment
+                price_adjust = 0.0
+                if slope > cfg['TREND_UP_THRESHOLD']:
+                    price_adjust = +cfg['TREND_VALUE']
+                elif slope < cfg['TREND_DOWN_THRESHOLD']:
+                    price_adjust = -cfg['TREND_VALUE']
 
-                # 3) Rebalance logic
-                buy_quantity  = ordersize
-                sell_quantity = ordersize
-                if cur_position > rebalance_limit:
-                    buy_quantity = rebalancesize
-                elif cur_position < -rebalance_limit:
-                    sell_quantity = rebalancesize
+                # 4) Rebalance if local position is large (for *this ticker*).
+                pos = positions[ticker]
+                buy_quantity = cfg['ORDER_SIZE']
+                sell_quantity = cfg['ORDER_SIZE']
+                if pos > cfg['REB_LIMIT']:
+                    buy_quantity = cfg['REB_SIZE']
+                elif pos < -cfg['REB_LIMIT']:
+                    sell_quantity = cfg['REB_SIZE']
 
-                # 4) Compute final buy/sell limit prices
+                # 5) Check the spread
                 spread = best_ask - best_bid
-                if spread >= MIN_SPREAD_REQUIRED:
-                    buy_price  = best_bid + IMPROVE_AMOUNT + price_adjustment
-                    sell_price = best_ask - IMPROVE_AMOUNT + price_adjustment
+                if spread >= cfg['MIN_SPREAD']:
+                    # We'll "improve" if the spread is big enough
+                    buy_price  = best_bid + cfg['IMPROVE'] + price_adjust
+                    sell_price = best_ask - cfg['IMPROVE'] + price_adjust
                 else:
-                    buy_price  = best_bid + price_adjustment
-                    sell_price = best_ask + price_adjustment
+                    # If not wide, place them close to the inside
+                    buy_price  = best_bid + price_adjust
+                    sell_price = best_ask + price_adjust
 
-                # 5) Place single buy + sell limit if not crossing
+                # 6) Only place symmetrical limit orders if they won't cross
+                #    so that we collect passive rebates (rather than paying active fees).
                 if buy_price < sell_price:
-                    s.post('http://localhost:9999/v1/orders',
-                           params={'ticker': ticker,
+                    # But first ensure that placing these orders won't exceed global limit 
+                    # if they get fully filled.
+                    # For example, if pos is +10k and we do a 4k buy, we'd have 14k net in this ticker.
+                    # Check other ticker positions to ensure total doesn't exceed 25k if all new orders fill.
+
+                    # Hypothetical new total if both a buy *and* sell fill:
+                    #   The net effect for "both filled" is zero net change.  We only risk extra position 
+                    #   if one side fills but not the other. 
+                    # For safety, check if buy side alone would push us over the limit:
+                    hypothetical_buy_fill = pos + buy_quantity
+                    # Then see if that combined with other positions would exceed limit
+                    new_pos_dict = positions.copy()
+                    new_pos_dict[ticker] = hypothetical_buy_fill
+                    if total_gross_position(new_pos_dict) <= GLOBAL_POSITION_LIMIT:
+                        # Place the buy limit 
+                        s.post('http://localhost:9999/v1/orders',
+                               params={
+                                   'ticker': ticker,
                                    'type': 'LIMIT',
                                    'quantity': buy_quantity,
                                    'action': 'BUY',
-                                   'price': buy_price})
-
-                    s.post('http://localhost:9999/v1/orders',
-                           params={'ticker': ticker,
+                                   'price': buy_price
+                               })
+                    
+                    # Check if the sell side alone would push us over. 
+                    hypothetical_sell_fill = pos - sell_quantity
+                    new_pos_dict[ticker] = hypothetical_sell_fill
+                    if total_gross_position(new_pos_dict) <= GLOBAL_POSITION_LIMIT:
+                        # Place the sell limit 
+                        s.post('http://localhost:9999/v1/orders',
+                               params={
+                                   'ticker': ticker,
                                    'type': 'LIMIT',
                                    'quantity': sell_quantity,
                                    'action': 'SELL',
-                                   'price': sell_price})
+                                   'price': sell_price
+                               })
 
-                # 6) Flatten if we exceed the 25,000 limit
-                flatten_excess_position(s, ticker, cur_position)
-
-                # 7) Cleanup if too many open orders
+            # 7) Housekeeping: if we have too many open orders, consider culling older ones, etc.
+            open_orders = get_orders(s, 'OPEN')
+            # Suppose we keep no more than 20 total across all tickers
+            while len(open_orders) > 20:
+                orderid = open_orders[-1]['order_id']
+                s.delete(f'http://localhost:9999/v1/orders/{orderid}')
+                sleep(BASE_SPEEDBUMP)
                 open_orders = get_orders(s, 'OPEN')
-                ticker_orders = [o for o in open_orders if o['ticker'] == ticker]
-                while len(ticker_orders) > orderslimit:
-                    orderid = ticker_orders[-1]['order_id']
-                    s.delete(f'http://localhost:9999/v1/orders/{orderid}')
-                    sleep(ticker_speedbump)
-                    open_orders = get_orders(s, 'OPEN')
-                    ticker_orders = [o for o in open_orders if o['ticker'] == ticker]
 
-            # pick the largest or average speedbump across all tickers 
-            # (in this example, we pick the max to be conservative)
-            final_speedbump = max(all_speedbumps) if all_speedbumps else BASE_SPEEDBUMP
-            sleep(final_speedbump)
-
-            # update tick for next loop
+            # 8) Sleep
+            sleep(BASE_SPEEDBUMP)
             tick = get_tick(s)
 
 if __name__ == '__main__':
-    shutdown = False
-    signal.signal(signal.SIGINT, signal_handler)
     main()
