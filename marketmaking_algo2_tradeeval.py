@@ -20,8 +20,7 @@ shutdown = False
 # General
 orderslimit = 6
 ordersize   = 4000
-# 0.2 for 100% and 0.1 for 200%
-BASE_SPEEDBUMP = 0.1
+BASE_SPEEDBUMP = 0.1    # 0.2 for 100% and 0.1 for 200%
 
 # Short-term trend detection
 WINDOW_SIZE          = 10
@@ -30,7 +29,7 @@ TREND_DOWN_THRESHOLD = -0.03
 TREND_VALUE = 0.0075
 
 # Adaptive improvement
-IMPROVE_AMOUNT      = 0.01
+IMPROVE_AMOUNT      = 0.011
 MIN_SPREAD_REQUIRED = 0.03
 
 ###############################################################################

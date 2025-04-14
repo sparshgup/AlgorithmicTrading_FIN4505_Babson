@@ -10,25 +10,16 @@ def signal_handler(signum, frame):
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     shutdown = True
 
-###############################################################################
-# CONFIGURATION
-###############################################################################
-
 API_KEY = {'X-API-Key': 'QDSFW62B'}
 
-# Overall time constraint
+###############################################################################
+# PARAMETERS
+###############################################################################
+
+# General
 ENDTIME = 300 
-BASE_SPEEDBUMP = 0.1
-
-# Global position limit: 25k
-GLOBAL_POSITION_LIMIT = 25000
-
-# Keep track of rolling mid-prices per ticker
-MID_PRICE_WINDOWS = {
-    'CNR': [],
-    'RY': [],
-    'AC': []
-}
+GLOBAL_POSITION_LIMIT = 24000
+BASE_SPEEDBUMP = 0.1    # 0.2 for 100% and 0.1 for 200%
 
 TICKER_CONFIG = {
     'CNR': {
@@ -36,9 +27,9 @@ TICKER_CONFIG = {
         'TREND_UP_THRESHOLD':  0.20,
         'TREND_DOWN_THRESHOLD': -0.20,
         'TREND_VALUE': 0.05,        
-        'ORDER_SIZE':  3000, 
+        'ORDER_SIZE':  2750, 
         'REB_SIZE':    500,       
-        'REB_LIMIT':   3000,     
+        'REB_LIMIT':   3500,     
         'MIN_SPREAD':  0.20,
         'IMPROVE':     0.02
     },
@@ -47,7 +38,7 @@ TICKER_CONFIG = {
         'TREND_UP_THRESHOLD':  0.10,
         'TREND_DOWN_THRESHOLD': -0.10,
         'TREND_VALUE': 0.03,
-        'ORDER_SIZE':  800, 
+        'ORDER_SIZE':  900, 
         'REB_SIZE':    400,
         'REB_LIMIT':   2500,
         'MIN_SPREAD':  0.10,
@@ -58,13 +49,21 @@ TICKER_CONFIG = {
         'TREND_UP_THRESHOLD':  0.15,
         'TREND_DOWN_THRESHOLD': -0.15,
         'TREND_VALUE': 0.04,
-        'ORDER_SIZE':  1200, 
+        'ORDER_SIZE':  900, 
         'REB_SIZE':    600,
-        'REB_LIMIT':   4000,
-        'MIN_SPREAD':  0.10,
+        'REB_LIMIT':   2000,
+        'MIN_SPREAD':  0.06,
         'IMPROVE':     0.02
     }
 }
+
+MID_PRICE_WINDOWS = {
+    'CNR': [],
+    'RY': [],
+    'AC': []
+}
+
+###############################################################################
 
 ###############################################################################
 # Helper Functions
@@ -115,19 +114,12 @@ def ticker_bid_ask(session, ticker):
     return best_bid, best_ask, book
 
 def get_orders(session, status='OPEN'):
-    """Returns all orders with a given status."""
     resp = session.get('http://localhost:9999/v1/orders', params={'status': status})
     if not resp.ok:
         raise ApiException("Error getting orders list")
     return resp.json()
 
 def flatten_if_exceeded(session, positions):
-    """
-    If our total position is beyond the global limit, we flatten 
-    or partially flatten across tickers as needed. 
-    Since ALGO2e typically rejects trades that would break the limit, 
-    this might be mostly defensive. 
-    """
     gross = total_gross_position(positions)
     if gross <= GLOBAL_POSITION_LIMIT:
         return  # No action needed
@@ -233,21 +225,10 @@ def main():
                 # 6) Only place symmetrical limit orders if they won't cross
                 #    so that we collect passive rebates (rather than paying active fees).
                 if buy_price < sell_price:
-                    # But first ensure that placing these orders won't exceed global limit 
-                    # if they get fully filled.
-                    # For example, if pos is +10k and we do a 4k buy, we'd have 14k net in this ticker.
-                    # Check other ticker positions to ensure total doesn't exceed 25k if all new orders fill.
-
-                    # Hypothetical new total if both a buy *and* sell fill:
-                    #   The net effect for "both filled" is zero net change.  We only risk extra position 
-                    #   if one side fills but not the other. 
-                    # For safety, check if buy side alone would push us over the limit:
                     hypothetical_buy_fill = pos + buy_quantity
-                    # Then see if that combined with other positions would exceed limit
                     new_pos_dict = positions.copy()
                     new_pos_dict[ticker] = hypothetical_buy_fill
                     if total_gross_position(new_pos_dict) <= GLOBAL_POSITION_LIMIT:
-                        # Place the buy limit 
                         s.post('http://localhost:9999/v1/orders',
                                params={
                                    'ticker': ticker,
@@ -261,7 +242,6 @@ def main():
                     hypothetical_sell_fill = pos - sell_quantity
                     new_pos_dict[ticker] = hypothetical_sell_fill
                     if total_gross_position(new_pos_dict) <= GLOBAL_POSITION_LIMIT:
-                        # Place the sell limit 
                         s.post('http://localhost:9999/v1/orders',
                                params={
                                    'ticker': ticker,
