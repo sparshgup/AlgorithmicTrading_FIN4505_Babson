@@ -3,28 +3,75 @@
 import re
 import math
 
+PIPELINE_PATTERN = re.compile(
+    r'PIPELINE COST FOR (.+?) (GOING UP TO|GOING DOWN TO|BACK TO) \$(\d{1,3}(?:,\d{3})*|\d+) PER LEASE',
+    re.IGNORECASE
+)
+
+ROUTE_TO_TICKER = {
+    'ALASKA TO CUSHING': 'AK-CS-PIPE',
+    'CUSHING TO NYC': 'CS-NYC-PIPE'
+}
+
 class FundamentalModel:
-    def __init__(self, session):
+    def __init__(self, session, market_state):
         self.session = session
+        self.market_state = market_state
         self.last_tick = -1
         self.signals = []
-        self.active_position = None
+        self.positions = []
+        self.release_queue = []
+        self.delta_projections = []
+        self.processed_headlines = set()
+        self.pending_release_after_exit = []
 
     def update(self, tick, period):
         if tick == self.last_tick:
             return
         self.last_tick = tick
 
-        if self.active_position:
-            self.check_exit(tick)
-        elif self.active_position is None and hasattr(self, 'release_queue') and self.release_queue:
-            for lease_id in self.release_queue:
+        self.check_exit(tick)
+
+        if not self.signals and self.pending_release_after_exit:
+            for lease_id in self.pending_release_after_exit:
                 self.session.release_lease(lease_id)
                 print(f"[p{period}][tick {tick}] Releasing Lease: {lease_id}")
-            self.release_queue.clear()
-        else:
-            self.check_for_news()
-            self.check_for_eia()
+            self.pending_release_after_exit.clear()
+
+        self.cleanup_deltas(tick)
+        #self.check_for_news()
+        #self.check_for_eia()
+        self.check_for_pipeline_news()
+
+    def check_for_pipeline_news(self):
+        resp = self.session.session.get('http://localhost:9999/v1/news')
+        for item in resp.json():
+            if item['tick'] + 2 < self.session.get_tick() or item['period'] != self.session.get_period():
+                continue
+            headline = item['headline']
+            if headline in self.processed_headlines:
+                continue
+
+            match = re.search(PIPELINE_PATTERN, headline)
+            if match:
+                route_str, action, price_str = match.groups()
+                price = int(price_str.replace(',', ''))
+                pipeline = ROUTE_TO_TICKER.get(route_str.upper())
+                if pipeline:
+                    old_cost = self.market_state['pipeline_costs'].get(pipeline, price)
+                    self.market_state['pipeline_costs'][pipeline] = price
+                    delta_cost = price - old_cost
+                    delta_price = delta_cost / 100000  # ~0.01 per $1000 change
+
+                    impacted_ticker = 'CL' if pipeline == 'AK-CS-PIPE' else 'CL-NYC'
+                    self.delta_projections.append({
+                        'ticker': impacted_ticker,
+                        'delta': delta_price,
+                        'decay_tick': self.last_tick + 20
+                    })
+                    print(f"[Pipeline news adjustment] {impacted_ticker} by {delta_price:.2f}")
+
+                self.processed_headlines.add(headline)
 
     def check_for_eia(self):
         resp = self.session.session.get('http://localhost:9999/v1/news')
@@ -32,53 +79,55 @@ class FundamentalModel:
             if item['tick'] + 2 < self.session.get_tick() or item['period'] != self.session.get_period():
                 continue
             headline = item['headline']
+            if headline in self.processed_headlines:
+                continue
             if 'WEEK' in headline and 'ACTUAL' in headline and 'FORECAST' in headline:
                 expected, actual = self._parse_eia_report(headline)
                 surprise = actual - expected
                 direction = "BUY" if surprise < 0 else "SELL"
                 confidence = abs(surprise * 0.10)
                 qty = min(30, int(confidence * 100))
-                prices = self.session.get_prices()
-                price = prices.get('CL')
+                projected_delta = -confidence if direction == "SELL" else confidence
 
-                if direction == "BUY":
-                    tanks_needed = math.ceil(qty / 10)
-                    for _ in range(tanks_needed):
+                self.delta_projections.append({
+                    'ticker': 'CL',
+                    'delta': projected_delta,
+                    'decay_tick': self.last_tick + 20
+                })
+
+                prices = self.session.get_prices()
+                price = prices.get('CL') if direction == 'BUY' else prices.get('CL-2F')
+                if not price:
+                    continue
+
+                if direction == 'BUY':
+                    lease_cost_total = math.ceil(qty / 10) * 500
+                    expected_gain = confidence * 1000 * qty
+                    if expected_gain < lease_cost_total:
+                        continue
+                    for _ in range(math.ceil(qty / 10)):
                         self.session.lease('CL-STORAGE')
-                    if price:
-                        self.signals.append({
-                            'ticker': 'CL',
-                            'action': 'BUY',
-                            'qty': qty,
-                            'note': f"EIA surprise: {surprise}M bbl"
-                        })
-                        self.active_position = {
-                            'ticker': 'CL',
-                            'side': direction,
-                            'qty': qty,
-                            'entry_price': price,
-                            'confidence': confidence,
-                            'tick_entered': self.last_tick,
-                            'storage_leased': tanks_needed
-                        }
+                    storage_leased = math.ceil(qty / 10)
                 else:
-                    price = prices.get('CL-2F')
-                    if price:
-                        self.signals.append({
-                            'ticker': 'CL-2F',
-                            'action': 'SELL',
-                            'qty': qty,
-                            'note': f"EIA surprise: {surprise}M bbl"
-                        })
-                        self.active_position = {
-                            'ticker': 'CL-2F',
-                            'side': 'SELL',
-                            'qty': qty,
-                            'entry_price': price,
-                            'confidence': confidence,
-                            'tick_entered': self.last_tick,
-                            'storage_leased': 0
-                        }
+                    storage_leased = 0
+
+                ticker = 'CL' if direction == 'BUY' else 'CL-2F'
+                self.signals.append({
+                    'ticker': ticker,
+                    'action': direction,
+                    'qty': qty,
+                    'note': f"EIA surprise: {surprise}M bbl"
+                })
+                self.positions.append({
+                    'ticker': ticker,
+                    'side': direction,
+                    'qty': qty,
+                    'entry_price': price,
+                    'confidence': confidence,
+                    'tick_entered': self.last_tick,
+                    'storage_leased': storage_leased
+                })
+                self.processed_headlines.add(headline)
 
     def _parse_eia_report(self, headline):
         actual_sign = -1 if 'ACTUAL DRAW' in headline else 1
@@ -96,32 +145,37 @@ class FundamentalModel:
 
     def check_exit(self, tick):
         prices = self.session.get_prices()
-        pos = self.active_position
-        price = prices.get(pos['ticker'])
-        if not price:
-            return
+        remaining_positions = []
 
-        pnl = (price - pos['entry_price']) if pos['side'] == 'BUY' else (pos['entry_price'] - price)
+        for pos in self.positions:
+            price = prices.get(pos['ticker'])
+            if not price:
+                remaining_positions.append(pos)
+                continue
 
-        if pnl >= pos['confidence'] or tick - pos['tick_entered'] > 28:
-            exit_action = 'SELL' if pos['side'] == 'BUY' else 'BUY'
-            self.signals.append({
-                'ticker': pos['ticker'],
-                'action': exit_action,
-                'qty': pos['qty'],
-                'note': f"Exit fundamental trade at PnL ${pnl:.2f}"
-            })
+            pnl = (price - pos['entry_price']) if pos['side'] == 'BUY' else (pos['entry_price'] - price)
 
-            if pos['ticker'] == 'CL' and pos['storage_leased'] > 0:
-                self.release_queue = []
-                leases = self.session.session.get('http://localhost:9999/v1/leases').json()
-                count = 0
-                for lease in leases:
-                    if lease['ticker'] == 'CL-STORAGE' and count < pos['storage_leased']:
-                        self.release_queue.append(lease['id'])
-                        count += 1
+            if pnl >= pos['confidence'] or tick - pos['tick_entered'] > 28:
+                exit_action = 'SELL' if pos['side'] == 'BUY' else 'BUY'
+                self.signals.append({
+                    'ticker': pos['ticker'],
+                    'action': exit_action,
+                    'qty': pos['qty'],
+                    'note': f"Exit trade at PnL ${pnl:.2f}"
+                })
 
-            self.active_position = None
+                # Queue lease release AFTER exit is executed
+                if pos['ticker'] == 'CL' and pos['storage_leased'] > 0:
+                    leases = self.session.session.get('http://localhost:9999/v1/leases').json()
+                    count = 0
+                    for lease in leases:
+                        if lease['ticker'] == 'CL-STORAGE' and count < pos['storage_leased']:
+                            self.pending_release_after_exit.append(lease['id'])
+                            count += 1
+            else:
+                remaining_positions.append(pos)
+
+        self.positions = remaining_positions
 
     def check_for_news(self):
         resp = self.session.session.get('http://localhost:9999/v1/news')
@@ -129,15 +183,37 @@ class FundamentalModel:
             if item['tick'] + 2 < self.session.get_tick() or item['period'] != self.session.get_period():
                 continue
             headline = item['headline']
+            if headline in self.processed_headlines:
+                continue
             impact = self._estimate_news_impact(headline)
             if impact:
-                direction = 'BUY' if impact > 0 else 'SELL'
-                confidence = abs(impact)
+                self.delta_projections.append({
+                    'ticker': 'CL',
+                    'delta': impact,
+                    'decay_tick': self.last_tick + 20
+                })
+                net_impact = sum([x['delta'] for x in self.delta_projections if x['ticker'] == 'CL'])
+
+                direction = 'BUY' if net_impact > 0 else 'SELL'
+                confidence = abs(net_impact)
                 qty = min(30, int(confidence * 100))
+
                 prices = self.session.get_prices()
                 price = prices.get('CL') if direction == 'BUY' else prices.get('CL-2F')
                 if not price:
-                    return
+                    continue
+
+                if direction == 'BUY':
+                    lease_cost_total = math.ceil(qty / 10) * 500
+                    expected_gain = confidence * 1000 * qty
+                    if expected_gain < lease_cost_total:
+                        continue
+                    for _ in range(math.ceil(qty / 10)):
+                        self.session.lease('CL-STORAGE')
+                    storage_leased = math.ceil(qty / 10)
+                else:
+                    storage_leased = 0
+
                 ticker = 'CL' if direction == 'BUY' else 'CL-2F'
                 self.signals.append({
                     'ticker': ticker,
@@ -145,13 +221,7 @@ class FundamentalModel:
                     'qty': qty,
                     'note': f"News: {headline}"
                 })
-                storage_leased = 0
-                if ticker == 'CL':
-                    tanks = math.ceil(qty / 10)
-                    for _ in range(tanks):
-                        self.session.lease('CL-STORAGE')
-                    storage_leased = tanks
-                self.active_position = {
+                self.positions.append({
                     'ticker': ticker,
                     'side': direction,
                     'qty': qty,
@@ -159,9 +229,31 @@ class FundamentalModel:
                     'confidence': confidence,
                     'tick_entered': self.last_tick,
                     'storage_leased': storage_leased
-                }
+                })
+                self.processed_headlines.add(headline)
+
+    def cleanup_deltas(self, tick):
+        self.delta_projections = [d for d in self.delta_projections if d['decay_tick'] > tick]
 
     def _estimate_news_impact(self, headline):
+        headline = headline.upper()
+        if 'STRAIT OF HORMUZ' in headline:
+            if 'TRAFFIC SLOWS' in headline:
+                return 0.2
+            elif 'READY TO DEFEND' in headline:
+                return -0.2
+        elif 'REPAIRS TO IMPERIAL OIL REFINERY' in headline:
+            return 0.2 
+        elif 'OFFSHORE DRILLING' in headline and 'HIGHER INSURANCE PREMIUMS' in headline:
+            return 0.3
+        elif 'REPAIRS SUCCESSFULLY COMPLETED AT IMPERIAL OIL REFINERY' in headline:
+            return -0.2
+        elif 'NEW OIL PROJECT IN NORTHWEST TERRITORIES' in headline:
+            return -0.1
+        elif 'INFLATION SLOWS DOWN' in headline:
+            return 0.3
+        elif 'PUNTLAND STATE OF SOMALIA' in headline:
+            return 0.2
         return 0
 
     def best_trade(self):

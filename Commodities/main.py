@@ -15,14 +15,20 @@ PRODUCT_TICKERS = ['HO', 'RB']
 GROSS_LIMIT = 500
 NET_LIMIT = 100
 
-
 def main():
     session = RITSession(API_KEY)
+    market_state = {
+        'pipeline_costs': {
+            'AK-CS-PIPE': 40000,
+            'CS-NYC-PIPE': 20000
+        }
+    }
+
     models = [
-        #FundamentalModel(session),
+        FundamentalModel(session, market_state),
         #StorageModel(session),
-        #TransportModel(session),
-        RefineryModel(session)
+        TransportModel(session, market_state),
+        #RefineryModel(session)
     ]
 
     while True:
@@ -41,7 +47,7 @@ def main():
                 print(f"[p{period}][tick {tick}] Executing: {trade}")
                 session.place_order(trade['ticker'], trade['action'], trade['qty'])
 
-        time.sleep(0.1)  
+        time.sleep(0.1)
 
 if __name__ == "__main__":
     main()

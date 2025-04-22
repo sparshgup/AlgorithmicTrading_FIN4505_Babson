@@ -3,12 +3,13 @@
 import math
 
 class TransportModel:
-    def __init__(self, session):
+    def __init__(self, session, market_state):
         self.session = session
+        self.market_state = market_state
         self.signals = []
         self.pending_transports = []
-        self.pipeline_costs = {'AK-CS-PIPE': 40000, 'CS-NYC-PIPE': 20000}
-        self.lease_ages = []
+        self.active_storage_leases = set()
+        self.active_routes = set()
 
     def update(self, tick, period):
         self.tick = tick
@@ -23,67 +24,82 @@ class TransportModel:
         cl = prices.get('CL')
         cl_nyc = prices.get('CL-NYC')
 
-        storage_cost = 0.10  # $0.10 per day (30 ticks)
+        cost_ak_cs = self.market_state['pipeline_costs']['AK-CS-PIPE']
+        cost_cs_nyc = self.market_state['pipeline_costs']['CS-NYC-PIPE']
 
+        # AK to CL batching
         if cl_ak and cl:
-            total_cost = (self.pipeline_costs['AK-CS-PIPE'] / 10000) + 2 * storage_cost
-            profit_ak_to_cl = cl - cl_ak - total_cost
-            if profit_ak_to_cl > 0.25:
-                self.execute_transport('CL-AK', 'CL', 10, 'AK-STORAGE', 'CL-STORAGE', 'AK-CS-PIPE', tick)
-
-        if cl and cl_nyc:
-            total_cost = (self.pipeline_costs['CS-NYC-PIPE'] / 10000) + 2 * storage_cost
-            profit_cl_to_nyc = cl_nyc - cl - total_cost
-            if profit_cl_to_nyc > 0.25:
-                self.execute_transport('CL', 'CL-NYC', 10, 'CL-STORAGE', 'NYC-STORAGE', 'CS-NYC-PIPE', tick)
-
-        if cl_ak and cl_nyc:
-            total_pipeline = (self.pipeline_costs['AK-CS-PIPE'] + self.pipeline_costs['CS-NYC-PIPE']) / 10000
-            total_cost = total_pipeline + 3 * storage_cost
-            profit_ak_to_nyc = cl_nyc - cl_ak - total_cost
-            if profit_ak_to_nyc > 0.30:
-                self.execute_transport('CL-AK', 'CL', 10, 'AK-STORAGE', 'CL-STORAGE', 'AK-CS-PIPE', tick, chain_next=True)
+            pipeline_cost = cost_ak_cs / 10000
+            storage_cost = 0.10
+            expected_profit = cl - (cl_ak + pipeline_cost + storage_cost)
+            max_batches = 10
+            for _ in range(max_batches):
+                if expected_profit <= 0.4:
+                    break
+                if not self.check_storage_capacity('AK-STORAGE') or not self.check_position_limits('CL-AK', 10):
+                    break
+                route_id = f'AK->CL:{tick}'
+                self.active_routes.add(route_id)
+                self.session.lease('AK-STORAGE')
+                self.session.place_order('CL-AK', 'BUY', 10)
+                self.session.lease('AK-CS-PIPE', from1='CL-AK', quantity1=10)
+                self.release_storage('AK-STORAGE')
                 self.pending_transports.append({
-                    'chain_next': True,
-                    'from': 'CL',
-                    'to': 'CL-NYC',
-                    'qty': 10,
-                    'tick_ready': tick + 30,
-                    'pipeline': 'CS-NYC-PIPE',
-                    'to_storage': 'NYC-STORAGE',
-                    'final_dest': 'CL-NYC'
+                    'from': 'CL-AK', 'to': 'CL', 'qty': 10, 'entry_tick': tick, 'ticker': 'CL',
+                    'pipeline': 'AK-CS-PIPE', 'release_to': 'CL-STORAGE', 'route_id': route_id,
+                    'arrival_tick': tick + 30
                 })
 
-    def execute_transport(self, from_ticker, to_ticker, qty, from_storage, to_storage, pipeline, tick, chain_next=False):
-        if from_storage:
-            self.session.lease(from_storage)
-            self.lease_ages.append({'id': None, 'tick_acquired': tick, 'storage': from_storage})
+        # CL to NYC batching
+        if cl and cl_nyc:
+            pipeline_cost = cost_cs_nyc / 10000
+            storage_cost = 0.10
+            expected_profit = cl_nyc - (cl + pipeline_cost + storage_cost)
+            max_batches = 10
+            for _ in range(max_batches):
+                if expected_profit <= 0.6:
+                    break
+                if not self.check_storage_capacity('CL-STORAGE') or not self.check_position_limits('CL', 10):
+                    break
+                route_id = f'CL->NYC:{tick}'
+                self.active_routes.add(route_id)
+                self.session.lease('CL-STORAGE')
+                self.session.place_order('CL', 'BUY', 10)
+                self.session.lease('CS-NYC-PIPE', from1='CL', quantity1=10)
+                self.release_storage('CL-STORAGE')
+                self.pending_transports.append({
+                    'from': 'CL', 'to': 'CL-NYC', 'qty': 10, 'entry_tick': tick, 'ticker': 'CL-NYC',
+                    'pipeline': 'CS-NYC-PIPE', 'release_to': 'NYC-STORAGE', 'route_id': route_id,
+                    'arrival_tick': tick + 30
+                })
 
-        self.session.place_order(from_ticker, 'BUY', qty)
-        self.session.lease(pipeline, from1=from_ticker, quantity1=qty)
+    def check_storage_capacity(self, ticker):
+        leases = self.session.session.get('http://localhost:9999/v1/leases').json()
+        count = sum(1 for lease in leases if lease['ticker'] == ticker)
+        return count < 10
 
-        if to_storage:
-            self.lease_ages.append({'id': None, 'tick_acquired': tick, 'storage': to_storage})
+    def check_position_limits(self, ticker, qty):
+        crude = ['CL', 'CL-AK', 'CL-NYC', 'CL-1F', 'CL-2F']
+        prod = ['HO', 'RB']
+        gross, net_crude, net_prod = self.session.get_limits(crude, prod)
+        if ticker in crude:
+            net_crude += qty
+        elif ticker in prod:
+            net_prod += qty
+        gross += qty
+        return gross <= 500 and abs(net_crude) <= 100 and abs(net_prod) <= 100
 
-        self.pending_transports.append({
-            'from': from_ticker,
-            'to': to_ticker,
-            'qty': qty,
-            'entry_tick': tick,
-            'ticker': to_ticker,
-            'pipeline': pipeline,
-            'auto_storage': to_storage,
-            'chain_next': chain_next
-        })
+    def release_storage(self, ticker):
+        leases = self.session.session.get('http://localhost:9999/v1/leases').json()
+        for lease in leases:
+            if lease['ticker'] == ticker and lease['containment_usage'] == 0:
+                self.session.release_lease(lease['id'])
+                break
 
     def check_exit(self, tick):
         prices = self.session.get_prices()
         for t in self.pending_transports[:]:
-            if t.get('chain_next') and tick >= t['tick_ready']:
-                self.session.lease(t['pipeline'], from1=t['from'], quantity1=t['qty'])
-                if t.get('to_storage'):
-                    self.lease_ages.append({'id': None, 'tick_acquired': tick, 'storage': t['to_storage']})
-                self.pending_transports.remove(t)
+            if tick < t.get('arrival_tick', 0):
                 continue
 
             if tick - t['entry_tick'] >= 30:
@@ -91,21 +107,20 @@ class TransportModel:
                 if current_price is None:
                     continue
                 self.signals.append({
-                    'ticker': t['ticker'],
-                    'action': 'SELL',
-                    'qty': t['qty'],
+                    'ticker': t['ticker'], 'action': 'SELL', 'qty': t['qty'],
                     'note': f"Exit transport {t['from']}→{t['to']}"
                 })
+                if t.get('release_to'):
+                    self.release_storage(t['release_to'])
+                if t.get('route_id'):
+                    self.active_routes.discard(t['route_id'])
                 self.pending_transports.remove(t)
 
     def cleanup_expired_leases(self, tick):
         leases = self.session.session.get('http://localhost:9999/v1/leases').json()
         for lease in leases:
-            for tracked in self.lease_ages[:]:
-                if lease['ticker'] == tracked['storage'] and tick - tracked['tick_acquired'] >= 29:
-                    if lease['containment_usage'] == 0:
-                        self.session.release_lease(lease['id'])
-                        self.lease_ages.remove(tracked)
+            if lease['containment_usage'] == 0:
+                self.session.release_lease(lease['id'])
 
     def best_trade(self):
         if not self.signals:
