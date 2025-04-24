@@ -25,9 +25,9 @@ def main():
     }
 
     models = [
-        FundamentalModel(session, market_state),
-        #StorageModel(session),
-        TransportModel(session, market_state),
+        #FundamentalModel(session, market_state),
+        StorageModel(session),
+        #TransportModel(session, market_state),
         #RefineryModel(session)
     ]
 
@@ -47,7 +47,7 @@ def main():
                 print(f"[p{period}][tick {tick}] Executing: {trade}")
                 session.place_order(trade['ticker'], trade['action'], trade['qty'])
 
-        time.sleep(0.1)
+        time.sleep(0.2)
 
 if __name__ == "__main__":
     main()

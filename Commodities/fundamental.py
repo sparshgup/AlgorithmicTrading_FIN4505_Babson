@@ -39,8 +39,8 @@ class FundamentalModel:
             self.pending_release_after_exit.clear()
 
         self.cleanup_deltas(tick)
-        #self.check_for_news()
-        #self.check_for_eia()
+        self.check_for_news()
+        self.check_for_eia()
         self.check_for_pipeline_news()
 
     def check_for_pipeline_news(self):
@@ -164,7 +164,7 @@ class FundamentalModel:
                     'note': f"Exit trade at PnL ${pnl:.2f}"
                 })
 
-                # Queue lease release AFTER exit is executed
+                # Queue lease release after exit is executed
                 if pos['ticker'] == 'CL' and pos['storage_leased'] > 0:
                     leases = self.session.session.get('http://localhost:9999/v1/leases').json()
                     count = 0
@@ -237,11 +237,10 @@ class FundamentalModel:
 
     def _estimate_news_impact(self, headline):
         headline = headline.upper()
-        if 'STRAIT OF HORMUZ' in headline:
-            if 'TRAFFIC SLOWS' in headline:
-                return 0.2
-            elif 'READY TO DEFEND' in headline:
-                return -0.2
+        if 'STRAIT OF HORMUZ' and 'TRAFFIC SLOWS' in headline:
+            return 0.2
+        if 'STRAIT OF HORMUZ' and 'READY TO DEFEND' in headline:
+            return -0.2
         elif 'REPAIRS TO IMPERIAL OIL REFINERY' in headline:
             return 0.2 
         elif 'OFFSHORE DRILLING' in headline and 'HIGHER INSURANCE PREMIUMS' in headline:
@@ -254,6 +253,63 @@ class FundamentalModel:
             return 0.3
         elif 'PUNTLAND STATE OF SOMALIA' in headline:
             return 0.2
+        elif 'CHINA BEGINS PRODUCTION ON NEW OIL SANDS' in headline:
+            return 0.15
+        elif 'NIGERIA TO INVEST' and 'IN NEW REFINERIES' in headline:
+            return -0.1
+        elif 'OPEC INCREASES OIL DEMAND FORECAST' in headline:
+            return 0.1
+        elif 'ECONOMISTS CONCERNED BY A RISE IN CONSUMER PRICES' in headline:
+            return -0.1
+        elif 'OPEC: TALKS OF NEW PRICE BAND' in headline:
+            return 0.2
+        elif 'METHANE BLOWOUT IN ALBERTA OIL RIG' in headline:
+            return -0.2
+        elif 'PEMEX INCREASES OUTPUT' in headline:
+            return 0.1
+        elif 'FIRST TRANSPORT FOR NEW' and 'PIPELINE' in headline:
+            return -0.1
+        elif 'EUR' and 'USD' and 'DROPS TO' and 'LOW' in headline:
+            return -0.4
+        elif 'EURO RECOVERS' in headline: 
+            return 0.4
+        elif 'IMF RAISES' and 'GAINS' in headline:
+            return 0.8
+        elif 'KELLOGG' and 'NEW BOARD MEMBERS' in headline:
+            return -0.3
+        elif 'TOYOTA' and 'SOLAR' and 'CARS' in headline:
+            return -0.4
+        elif 'GLOBAL STOCKS TUMBLE' in headline:
+            return -0.4
+        elif 'TENSION' and 'SUDAN OIL SHUTDOWN' in headline:
+            return -0.4
+        elif 'FLASH CRASH' in headline:
+            return -0.2
+        elif 'EXPERIENCES LARGE SLOW IN REGIONAL TRAVEL' in headline:
+            return -0.5
+        elif 'MARKETS SLIDE' and 'JOB REPORTS' in headline:
+            return 0.1
+        elif 'OIL EXTRACTION WORKERS' and 'STRIKE' in headline:
+            return 0.1
+        elif 'UNUSUAL WEATHER PATTERN FREEZES EUROPE' in headline:
+            return 0.2 
+        elif 'NIGERIAN GOVERNMENT REVOKES DRILLING RIGHTS' in headline:
+            return 0.2
+        elif 'PIRATES ATTACK' in headline:
+            return 0.15
+        elif 'EXTEREME WEATHER CONDITIONS' and 'PIPELINE DAMAGE' in headline:
+            return -0.1
+        elif 'BOMBING IN SYRIAN CAPITAL' in headline:
+            return 0.1
+        elif 'RUMORS OF DEPLETING RESOURCES' in headline:
+            return -0.15
+        elif 'US DOLLAR' and 'STRENGTHEN' in headline:
+            return 0.2
+        elif 'LARGE OIL WELLS FOUND' in headline:
+            return -0.5
+        elif 'TENSION AS NIGERIAN ELECTIONS UNDERWAY' in headline:
+            return -0.2
+        
         return 0
 
     def best_trade(self):

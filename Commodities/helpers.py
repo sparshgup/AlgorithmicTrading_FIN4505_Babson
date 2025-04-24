@@ -1,5 +1,4 @@
 import requests
-import time
 
 class RITSession:
     def __init__(self, api_key):
