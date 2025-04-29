@@ -1,83 +1,86 @@
 # refinery.py
 
-import math
-
 class RefineryModel:
-    def __init__(self, session):
+    def __init__(self, session, lease_manager):
         self.session = session
+        self.lease_manager = lease_manager
         self.signals = []
         self.lease_id = None
-        self.lease_end_tick = None
         self.refining = False
-        self.refining_tick = None
-        self.refining_abs_tick = None
-        self.refine_count = 0
-        self.max_refinements = 26
-        self.storage_leased = False
+        self.refining_start_tick = None
+        self.refining_abs_start_tick = None
         self.refinery_leased = False
 
     def update(self, tick, period):
         self.tick = tick
         self.period = period
-        abs_tick = (period - 1) * 600 + tick
+        self.abs_tick = (period - 1) * 600 + tick
 
+        self.ensure_refinery_leased()
+
+        if self.refining:
+            if self.abs_tick >= self.refining_abs_start_tick + 45:
+                self.complete_refining_batch()
+        else:
+            self.start_refining_batch()
+
+    def ensure_refinery_leased(self):
         if not self.refinery_leased:
             self.session.lease('CL-REFINERY')
             leases = self.session.session.get('http://localhost:9999/v1/leases', params={'ticker': 'CL-REFINERY'}).json()
             for x in leases:
                 if x['ticker'] == 'CL-REFINERY':
                     self.lease_id = x['id']
-                    self.lease_end_tick = x['next_lease_tick']
                     self.refinery_leased = True
                     break
 
-        if not self.storage_leased:
-            for _ in range(3):
-                self.session.lease('CL-STORAGE')
-            self.storage_leased = True
+    def start_refining_batch(self):
+        positions = self.session.session.get('http://localhost:9999/v1/securities').json()
+        cl_position = next((sec['position'] for sec in positions if sec['ticker'] == 'CL'), 0)
 
-        if self.refining and abs_tick == self.refining_abs_tick + 45:
-            hedge_ticker = 'CL-1F' if self.refining_abs_tick < 600 else 'CL-2F'
-            self.signals.append({'ticker': hedge_ticker, 'action': 'BUY', 'qty': 30, 'note': 'Unwind hedge'})
-            self.signals.append({'ticker': 'HO', 'action': 'SELL', 'qty': 10, 'note': 'Refined HO'})
-            self.signals.append({'ticker': 'RB', 'action': 'SELL', 'qty': 20, 'note': 'Refined RB'})
-            self.refining = False
-
-        if not self.refining and self.refine_count < self.max_refinements:
-            self.start_refinement(tick, period, abs_tick)
-
-        if self.lease_id and tick == self.lease_end_tick - 1:
-            self.session.release_lease(self.lease_id)
-            self.lease_id = None
-            self.lease_end_tick = None
-            self.refinery_leased = False
-
-    def start_refinement(self, tick, period, abs_tick):
-        prices = self.session.get_prices()
-        cl = prices.get('CL')
-        ho = prices.get('HO')
-        rb = prices.get('RB')
-        if not cl or not ho or not rb:
+        if cl_position < 30:
+            self.lease_manager.request_storage('CL-STORAGE', 3)
+            self.session.place_order('CL', 'BUY', 30)
             return
 
-        self.session.place_order('CL', 'BUY', 30)
-
-        positions = self.session.session.get('http://localhost:9999/v1/securities').json()
-        for x in positions:
-            if x['ticker'] == 'CL' and x['position'] < 30:
-                return
-
         self.session.session.post(f'http://localhost:9999/v1/leases/{self.lease_id}', params={'from1': 'CL', 'quantity1': 30})
-
-        hedge_ticker = 'CL-1F' if abs_tick < 600 else 'CL-2F'
+        hedge_ticker = 'CL-2F'
         self.session.place_order(hedge_ticker, 'SELL', 30)
 
-        self.refining_tick = tick
-        self.refining_abs_tick = abs_tick
         self.refining = True
-        self.refine_count += 1
+        self.refining_start_tick = self.tick
+        self.refining_abs_start_tick = self.abs_tick
+
+    def complete_refining_batch(self):
+        hedge_ticker = 'CL-1F' if self.refining_abs_start_tick < 600 else 'CL-2F'
+
+        self.signals.append({'ticker': hedge_ticker, 'action': 'BUY', 'qty': 30, 'note': 'Unwind refinery hedge'})
+        self.signals.append({'ticker': 'HO', 'action': 'SELL', 'qty': 10, 'note': 'Sell HO after refining'})
+        self.signals.append({'ticker': 'RB', 'action': 'SELL', 'qty': 20, 'note': 'Sell RB after refining'})
+
+        self.refining = False
 
     def best_trade(self):
         if not self.signals:
             return None
         return self.signals.pop(0)
+
+    def expected_profit(self):
+        prices = self.session.get_prices()
+        if not prices:
+            return 0, 0
+
+        cl = prices.get('CL')
+        ho = prices.get('HO')
+        rb = prices.get('RB')
+        if not cl or not ho or not rb:
+            return 0, 0
+
+        refinery_cost = 300000
+        crude_cost = 30 * cl * 1000
+        product_revenue = (10 * ho * 42000) + (20 * rb * 42000)
+        storage_cost = 3 * 500
+
+        expected_profit = product_revenue - crude_cost - refinery_cost - storage_cost
+        certainty = 0.7
+        return expected_profit, certainty

@@ -14,13 +14,13 @@ ROUTE_TO_TICKER = {
 }
 
 class FundamentalModel:
-    def __init__(self, session, market_state):
+    def __init__(self, session, market_state, lease_manager):
         self.session = session
         self.market_state = market_state
+        self.lease_manager = lease_manager
         self.last_tick = -1
         self.signals = []
         self.positions = []
-        self.release_queue = []
         self.delta_projections = []
         self.processed_headlines = set()
         self.pending_release_after_exit = []
@@ -35,7 +35,6 @@ class FundamentalModel:
         if not self.signals and self.pending_release_after_exit:
             for lease_id in self.pending_release_after_exit:
                 self.session.release_lease(lease_id)
-                print(f"[p{period}][tick {tick}] Releasing Lease: {lease_id}")
             self.pending_release_after_exit.clear()
 
         self.cleanup_deltas(tick)
@@ -61,7 +60,7 @@ class FundamentalModel:
                     old_cost = self.market_state['pipeline_costs'].get(pipeline, price)
                     self.market_state['pipeline_costs'][pipeline] = price
                     delta_cost = price - old_cost
-                    delta_price = delta_cost / 100000  # ~0.01 per $1000 change
+                    delta_price = -delta_cost / 100000
 
                     impacted_ticker = 'CL' if pipeline == 'AK-CS-PIPE' else 'CL-NYC'
                     self.delta_projections.append({
@@ -69,7 +68,6 @@ class FundamentalModel:
                         'delta': delta_price,
                         'decay_tick': self.last_tick + 20
                     })
-                    print(f"[Pipeline news adjustment] {impacted_ticker} by {delta_price:.2f}")
 
                 self.processed_headlines.add(headline)
 
@@ -98,25 +96,19 @@ class FundamentalModel:
                 prices = self.session.get_prices()
                 price = prices.get('CL') if direction == 'BUY' else prices.get('CL-2F')
                 if not price:
-                    continue
+                    return
 
                 if direction == 'BUY':
-                    lease_cost_total = math.ceil(qty / 10) * 500
-                    expected_gain = confidence * 1000 * qty
-                    if expected_gain < lease_cost_total:
-                        continue
-                    for _ in range(math.ceil(qty / 10)):
-                        self.session.lease('CL-STORAGE')
-                    storage_leased = math.ceil(qty / 10)
-                else:
-                    storage_leased = 0
+                    tanks_needed = (qty + 9) // 10
+                    self.lease_manager.request_storage('CL-STORAGE', tanks_needed)
 
                 ticker = 'CL' if direction == 'BUY' else 'CL-2F'
                 self.signals.append({
                     'ticker': ticker,
                     'action': direction,
                     'qty': qty,
-                    'note': f"EIA surprise: {surprise}M bbl"
+                    'note': f"EIA surprise: {surprise}M bbl",
+                    'tick_created': self.last_tick
                 })
                 self.positions.append({
                     'ticker': ticker,
@@ -125,7 +117,7 @@ class FundamentalModel:
                     'entry_price': price,
                     'confidence': confidence,
                     'tick_entered': self.last_tick,
-                    'storage_leased': storage_leased
+                    'storage_leased': qty // 10 if direction == 'BUY' else 0
                 })
                 self.processed_headlines.add(headline)
 
@@ -134,7 +126,7 @@ class FundamentalModel:
         forecast_sign = -1 if 'FORECAST DRAW' in headline else 1
 
         actual_match = re.search(r'ACTUAL (?:DRAW|BUILD) (\d+)', headline)
-        forecast_match = re.search(r'FORECAST (?:DRAW|BUILD) (\d+)', headline)
+        forecast_match = re.search(r'FORECAST (?:DRAW|BUILD) (\d+) ', headline)
 
         if actual_match and forecast_match:
             actual = actual_sign * int(actual_match.group(1))
@@ -154,8 +146,13 @@ class FundamentalModel:
                 continue
 
             pnl = (price - pos['entry_price']) if pos['side'] == 'BUY' else (pos['entry_price'] - price)
+            hold_duration = tick - pos['tick_entered']
 
-            if pnl >= pos['confidence'] or tick - pos['tick_entered'] > 28:
+            if hold_duration < 5:
+                remaining_positions.append(pos)
+                continue
+
+            if pnl >= pos['confidence'] or hold_duration > 28:
                 exit_action = 'SELL' if pos['side'] == 'BUY' else 'BUY'
                 self.signals.append({
                     'ticker': pos['ticker'],
@@ -164,7 +161,6 @@ class FundamentalModel:
                     'note': f"Exit trade at PnL ${pnl:.2f}"
                 })
 
-                # Queue lease release after exit is executed
                 if pos['ticker'] == 'CL' and pos['storage_leased'] > 0:
                     leases = self.session.session.get('http://localhost:9999/v1/leases').json()
                     count = 0
@@ -192,7 +188,7 @@ class FundamentalModel:
                     'delta': impact,
                     'decay_tick': self.last_tick + 20
                 })
-                net_impact = sum([x['delta'] for x in self.delta_projections if x['ticker'] == 'CL'])
+                net_impact = sum(x['delta'] for x in self.delta_projections if x['ticker'] == 'CL')
 
                 direction = 'BUY' if net_impact > 0 else 'SELL'
                 confidence = abs(net_impact)
@@ -201,25 +197,19 @@ class FundamentalModel:
                 prices = self.session.get_prices()
                 price = prices.get('CL') if direction == 'BUY' else prices.get('CL-2F')
                 if not price:
-                    continue
+                    return
 
                 if direction == 'BUY':
-                    lease_cost_total = math.ceil(qty / 10) * 500
-                    expected_gain = confidence * 1000 * qty
-                    if expected_gain < lease_cost_total:
-                        continue
-                    for _ in range(math.ceil(qty / 10)):
-                        self.session.lease('CL-STORAGE')
-                    storage_leased = math.ceil(qty / 10)
-                else:
-                    storage_leased = 0
+                    tanks_needed = (qty + 9) // 10
+                    self.lease_manager.request_storage('CL-STORAGE', tanks_needed)
 
                 ticker = 'CL' if direction == 'BUY' else 'CL-2F'
                 self.signals.append({
                     'ticker': ticker,
                     'action': direction,
                     'qty': qty,
-                    'note': f"News: {headline}"
+                    'note': f"News: {headline}",
+                    'tick_created': self.last_tick
                 })
                 self.positions.append({
                     'ticker': ticker,
@@ -228,7 +218,7 @@ class FundamentalModel:
                     'entry_price': price,
                     'confidence': confidence,
                     'tick_entered': self.last_tick,
-                    'storage_leased': storage_leased
+                    'storage_leased': qty // 10 if direction == 'BUY' else 0
                 })
                 self.processed_headlines.add(headline)
 
@@ -241,11 +231,11 @@ class FundamentalModel:
             return 0.2
         if 'STRAIT OF HORMUZ' and 'READY TO DEFEND' in headline:
             return -0.2
-        elif 'REPAIRS TO IMPERIAL OIL REFINERY' in headline:
+        elif 'REPAIRS' and 'IMPERIAL OIL REFINERY' in headline:
             return 0.2 
         elif 'OFFSHORE DRILLING' in headline and 'HIGHER INSURANCE PREMIUMS' in headline:
             return 0.3
-        elif 'REPAIRS SUCCESSFULLY COMPLETED AT IMPERIAL OIL REFINERY' in headline:
+        elif 'REPAIRS SUCCESSFULLY COMPLETED' and 'IMPERIAL OIL REFINERY' in headline:
             return -0.2
         elif 'NEW OIL PROJECT IN NORTHWEST TERRITORIES' in headline:
             return -0.1
@@ -253,27 +243,27 @@ class FundamentalModel:
             return 0.3
         elif 'PUNTLAND STATE OF SOMALIA' in headline:
             return 0.2
-        elif 'CHINA BEGINS PRODUCTION ON NEW OIL SANDS' in headline:
+        elif 'CHINA' and 'PRODUCTION' and 'NEW OIL SANDS' in headline:
             return 0.15
-        elif 'NIGERIA TO INVEST' and 'IN NEW REFINERIES' in headline:
+        elif 'NIGERIA TO INVEST' and 'NEW REFINERIES' in headline:
             return -0.1
         elif 'OPEC INCREASES OIL DEMAND FORECAST' in headline:
             return 0.1
-        elif 'ECONOMISTS CONCERNED BY A RISE IN CONSUMER PRICES' in headline:
+        elif 'ECONOMISTS CONCERNED' and 'RISE' and 'CONSUMER PRICES' in headline:
             return -0.1
-        elif 'OPEC: TALKS OF NEW PRICE BAND' in headline:
+        elif 'OPEC' and 'NEW PRICE BAND' in headline:
             return 0.2
-        elif 'METHANE BLOWOUT IN ALBERTA OIL RIG' in headline:
+        elif 'METHANE BLOWOUT' and 'ALBERTA OIL RIG' in headline:
             return -0.2
         elif 'PEMEX INCREASES OUTPUT' in headline:
             return 0.1
-        elif 'FIRST TRANSPORT FOR NEW' and 'PIPELINE' in headline:
-            return -0.1
+        elif 'FIRST TRANSPORT' and 'NEW' and 'PIPELINE' in headline:
+            return -0.2
         elif 'EUR' and 'USD' and 'DROPS TO' and 'LOW' in headline:
             return -0.4
         elif 'EURO RECOVERS' in headline: 
             return 0.4
-        elif 'IMF RAISES' and 'GAINS' in headline:
+        elif 'GAINS' and 'IMF RAISES' in headline:
             return 0.8
         elif 'KELLOGG' and 'NEW BOARD MEMBERS' in headline:
             return -0.3
@@ -285,34 +275,64 @@ class FundamentalModel:
             return -0.4
         elif 'FLASH CRASH' in headline:
             return -0.2
-        elif 'EXPERIENCES LARGE SLOW IN REGIONAL TRAVEL' in headline:
+        elif 'LARGE SLOW' and 'REGIONAL TRAVEL' in headline:
             return -0.5
         elif 'MARKETS SLIDE' and 'JOB REPORTS' in headline:
             return 0.1
         elif 'OIL EXTRACTION WORKERS' and 'STRIKE' in headline:
             return 0.1
-        elif 'UNUSUAL WEATHER PATTERN FREEZES EUROPE' in headline:
+        elif 'UNUSUAL WEATHER PATTERN' and 'FREEZES EUROPE' in headline:
             return 0.2 
-        elif 'NIGERIAN GOVERNMENT REVOKES DRILLING RIGHTS' in headline:
+        elif 'NIGERIAN GOVERNMENT' and 'REVOKES' and 'DRILLING RIGHTS' in headline:
             return 0.2
         elif 'PIRATES ATTACK' in headline:
             return 0.15
         elif 'EXTEREME WEATHER CONDITIONS' and 'PIPELINE DAMAGE' in headline:
             return -0.1
-        elif 'BOMBING IN SYRIAN CAPITAL' in headline:
+        elif 'BOMBING' and 'SYRIAN CAPITAL' in headline:
             return 0.1
-        elif 'RUMORS OF DEPLETING RESOURCES' in headline:
+        elif 'RUMORS' and 'DEPLETING RESOURCES' in headline:
             return -0.15
         elif 'US DOLLAR' and 'STRENGTHEN' in headline:
             return 0.2
         elif 'LARGE OIL WELLS FOUND' in headline:
             return -0.5
-        elif 'TENSION AS NIGERIAN ELECTIONS UNDERWAY' in headline:
+        elif 'TENSION' and 'NIGERIAN ELECTIONS' in headline:
             return -0.2
-        
+        elif 'MILITANT' and 'ATTACK' in headline:
+            return 0.1
+        elif 'FUEL' and 'DEMAND' and 'LOW' in headline:
+            return -0.2
+        elif 'PROTESTS' and 'VIOLENT' in headline:
+            return -0.1
         return 0
 
     def best_trade(self):
         if not self.signals:
             return None
-        return self.signals.pop(0)
+        for i, signal in enumerate(self.signals):
+            if 'tick_created' in signal:
+                if self.last_tick - signal['tick_created'] >= 2:
+                    return self.signals.pop(i)
+            else:
+                return self.signals.pop(i)
+        return None
+
+    def expected_profit(self):
+        if not self.signals:
+            return 0, 0
+
+        signal = self.signals[0]
+        qty = signal['qty']
+        delta = 0
+        for proj in self.delta_projections:
+            if proj['ticker'] == 'CL':
+                delta += proj['delta']
+
+        expected_profit = abs(delta) * 1000 * qty
+        certainty = 0.7
+
+        if 'EIA' in signal.get('note', ''):
+            certainty = 0.95
+
+        return expected_profit, certainty
