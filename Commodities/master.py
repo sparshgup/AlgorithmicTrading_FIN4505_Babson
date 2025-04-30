@@ -31,10 +31,10 @@ class MasterController:
         self.fundamental_model = FundamentalModel(self.session, self.market_state, self.lease_manager)
 
         self.models = [
-            #self.fundamental_model,
-            StorageModel(self.session, self.lease_manager),
-            #TransportModel(self.session, self.market_state, self.lease_manager, self.fundamental_model.get_cl_prediction),
-            #RefineryModel(self.session, self.lease_manager, self.hedge_manager, self.fundamental_model.get_cl_forecast)
+            self.fundamental_model,
+            # StorageModel(self.session, self.lease_manager),
+            TransportModel(self.session, self.market_state, self.lease_manager, self.fundamental_model.get_cl_prediction),
+            RefineryModel(self.session, self.lease_manager, self.hedge_manager, self.fundamental_model.get_cl_forecast)
         ]
 
         self.hedge_manager = hedge_manager.HedgeManager(self.session)
