@@ -7,12 +7,10 @@ class HedgeManager:
         self.last_tick = -1
 
     def manage(self, tick, period, prices):
-        self.last_tick = tick
+        self.last_tick = self.session.get_tick()
 
         if period == 1 and tick >= 595:
             self.rollover_cl1f_to_cl2f()
-
-        # Step 2: (later) Rebalance hedges dynamically if needed
 
     def rollover_cl1f_to_cl2f(self):
         positions = self.session.session.get('http://localhost:9999/v1/securities').json()
@@ -32,7 +30,7 @@ class HedgeManager:
             side = 'BUY' if cl1f_pos < 0 else 'SELL'
             self.session.place_order('CL-1F', side, abs(cl1f_pos))
 
-    def hedge_position(self, ticker, quantity, certainty=1.0):
+    def hedge_position(self, quantity, certainty=1.0):
         hedge_strength = self.calculate_hedge_strength(certainty)
         hedge_qty = int(abs(quantity) * hedge_strength)
 
@@ -40,12 +38,14 @@ class HedgeManager:
             print(f"[tick {self.last_tick}] Skipping hedge due to high certainty ({certainty:.2f})")
             return
 
-        hedge_ticker = 'CL-1F' if self.last_tick < 580 else 'CL-2F'
+        hedge_ticker = 'CL-2F'
         action = 'SELL' if quantity > 0 else 'BUY'
 
         print(f"[tick {self.last_tick}] Hedging {hedge_qty} contracts on {hedge_ticker} (certainty={certainty:.2f})")
 
         self.session.place_order(hedge_ticker, action, hedge_qty)
+
+        return hedge_qty
 
     def calculate_hedge_strength(self, certainty):
         """

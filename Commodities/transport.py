@@ -3,10 +3,11 @@
 from collections import defaultdict
 
 class TransportModel:
-    def __init__(self, session, market_state, lease_manager):
+    def __init__(self, session, market_state, lease_manager, cl_prediction_func):
         self.session = session
         self.market_state = market_state
         self.lease_manager = lease_manager
+        self.cl_prediction_func = cl_prediction_func 
         self.signals = []
         self.pending_transports = []
         self.active_storage_leases = set()
@@ -42,18 +43,14 @@ class TransportModel:
         cost_ak_cs = self.market_state['pipeline_costs']['AK-CS-PIPE']
         cost_cs_nyc = self.market_state['pipeline_costs']['CS-NYC-PIPE']
 
-        if cl_ak and cl:
-            pipeline_cost = cost_ak_cs / 10000
-            storage_cost = 0.10
-            expected_profit = cl - (cl_ak + pipeline_cost + storage_cost)
-            max_batches = 10
+        cl_pred = self.cl_prediction_func(tick)
+
+        # AK → CL arbitrage
+        if cl_ak and cl and cl_pred != 'down':  # don't buy if CL expected to fall
             route_id = 'AK->CL'
-            for _ in range(max_batches):
-                if expected_profit <= 0.4:
-                    break
+            profit = cl - (cl_ak + cost_ak_cs / 10000 + 0.10)
+            while profit > 0.4 and self.in_flight[route_id] + 10 <= 100: 
                 if not self.check_storage_capacity('AK-STORAGE') or not self.check_position_limits('CL-AK', 10):
-                    break
-                if self.in_flight[route_id] + 10 > 100:
                     break
                 self.in_flight[route_id] += 10
 
@@ -62,30 +59,20 @@ class TransportModel:
                 self.session.lease('AK-CS-PIPE', from1='CL-AK', quantity1=10)
                 self.release_storage('AK-STORAGE')
                 self.pending_transports.append({
-                    'from': 'CL-AK',
-                    'to': 'CL',
-                    'qty': 10,
-                    'entry_tick': tick,
-                    'ticker': 'CL',
-                    'pipeline': 'AK-CS-PIPE',
-                    'release_to': 'CL-STORAGE',
-                    'route_id': route_id,
-                    'arrival_tick': tick + 30,
-                    'leased_dest': False
+                    'from': 'CL-AK', 'to': 'CL', 'qty': 10, 'ticker': 'CL',
+                    'pipeline': 'AK-CS-PIPE', 'release_to': 'CL-STORAGE',
+                    'entry_tick': tick, 'arrival_tick': tick + 30,
+                    'route_id': route_id, 'leased_dest': False
                 })
 
-        if cl and cl_nyc:
-            pipeline_cost = cost_cs_nyc / 10000
-            storage_cost = 0.10
-            expected_profit = cl_nyc - (cl + pipeline_cost + storage_cost)
-            max_batches = 10
+                print(f"[p{self.period}] [tick {self.tick}] Performing normal arbitrage from AK->CL")
+
+        # CL → NYC arbitrage
+        if cl and cl_nyc and cl_pred != 'up':  # don't ship if CL expected to rise
             route_id = 'CL->NYC'
-            for _ in range(max_batches):
-                if expected_profit <= 0.6:
-                    break
+            profit = cl_nyc - (cl + cost_cs_nyc / 10000 + 0.10)
+            while profit > 0.6 and self.in_flight[route_id] + 10 <= 100: #0.6
                 if not self.check_storage_capacity('CL-STORAGE') or not self.check_position_limits('CL', 10):
-                    break
-                if self.in_flight[route_id] + 10 > 100:
                     break
                 self.in_flight[route_id] += 10
 
@@ -94,17 +81,13 @@ class TransportModel:
                 self.session.lease('CS-NYC-PIPE', from1='CL', quantity1=10)
                 self.release_storage('CL-STORAGE')
                 self.pending_transports.append({
-                    'from': 'CL',
-                    'to': 'CL-NYC',
-                    'qty': 10,
-                    'entry_tick': tick,
-                    'ticker': 'CL-NYC',
-                    'pipeline': 'CS-NYC-PIPE',
-                    'release_to': 'NYC-STORAGE',
-                    'route_id': route_id,
-                    'arrival_tick': tick + 30,
-                    'leased_dest': False
+                    'from': 'CL', 'to': 'CL-NYC', 'qty': 10, 'ticker': 'CL-NYC',
+                    'pipeline': 'CS-NYC-PIPE', 'release_to': 'NYC-STORAGE',
+                    'entry_tick': tick, 'arrival_tick': tick + 30,
+                    'route_id': route_id, 'leased_dest': False
                 })
+
+                print(f"[p{self.period}] [tick {self.tick}] Performing normal arbitrage from AK->CL")
 
     def check_storage_capacity(self, ticker):
         leases = self.session.session.get('http://localhost:9999/v1/leases').json()
@@ -127,7 +110,6 @@ class TransportModel:
         for lease in leases:
             if lease['ticker'] == ticker and lease['containment_usage'] == 0 and lease['id'] not in self.reserved_lease_ids:
                 self.lease_manager.unmark_reserved(lease['id'])
-
 
     def check_exit(self, tick):
         prices = self.session.get_prices()

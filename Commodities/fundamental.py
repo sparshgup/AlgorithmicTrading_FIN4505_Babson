@@ -39,7 +39,7 @@ class FundamentalModel:
 
         self.cleanup_deltas(tick)
         self.check_for_news()
-        self.check_for_eia()
+        self.check_for_eia(period)
         self.check_for_pipeline_news()
 
     def check_for_pipeline_news(self):
@@ -71,7 +71,7 @@ class FundamentalModel:
 
                 self.processed_headlines.add(headline)
 
-    def check_for_eia(self):
+    def check_for_eia(self, period):
         resp = self.session.session.get('http://localhost:9999/v1/news')
         for item in resp.json():
             if item['tick'] + 2 < self.session.get_tick() or item['period'] != self.session.get_period():
@@ -84,41 +84,55 @@ class FundamentalModel:
                 surprise = actual - expected
                 direction = "BUY" if surprise < 0 else "SELL"
                 confidence = abs(surprise * 0.10)
-                qty = min(30, int(confidence * 100))
-                projected_delta = -confidence if direction == "SELL" else confidence
-
+                delta = -confidence if direction == "SELL" else confidence
                 self.delta_projections.append({
                     'ticker': 'CL',
-                    'delta': projected_delta,
+                    'delta': delta,
                     'decay_tick': self.last_tick + 20
                 })
-
+                                
                 prices = self.session.get_prices()
-                price = prices.get('CL') if direction == 'BUY' else prices.get('CL-2F')
-                if not price:
+                gross, net_crude, net_prod = self.session.get_limits(
+                    ['CL', 'CL-AK', 'CL-NYC', 'CL-1F', 'CL-2F'], ['HO', 'RB']
+                )
+
+                available_lots = min((500 - gross) // 10, (100 - abs(net_crude)) // 10)
+                if available_lots <= 0:
                     return
 
+                tickers = []
                 if direction == 'BUY':
-                    tanks_needed = (qty + 9) // 10
-                    self.lease_manager.request_storage('CL-STORAGE', tanks_needed)
+                    tickers = ['CL-1F', 'CL-2F', 'CL'] if period == 1 else ['CL-2F', 'CL']
+                else:
+                    tickers = ['CL-2F', 'CL-1F', 'CL'] if period == 1 else ['CL-2F', 'CL']
 
-                ticker = 'CL' if direction == 'BUY' else 'CL-2F'
-                self.signals.append({
-                    'ticker': ticker,
-                    'action': direction,
-                    'qty': qty,
-                    'note': f"EIA surprise: {surprise}M bbl",
-                    'tick_created': self.last_tick
-                })
-                self.positions.append({
-                    'ticker': ticker,
-                    'side': direction,
-                    'qty': qty,
-                    'entry_price': price,
-                    'confidence': confidence,
-                    'tick_entered': self.last_tick,
-                    'storage_leased': qty // 10 if direction == 'BUY' else 0
-                })
+                for ticker in tickers:
+                    while available_lots > 0:
+                        price = prices.get(ticker)
+                        if not price:
+                            break
+                        if direction == 'BUY':
+                            self.lease_manager.request_storage('CL-STORAGE', 1)
+
+                        self.signals.append({
+                            'ticker': ticker,
+                            'action': direction,
+                            'qty': 10,
+                            'note': f"EIA {direction} {ticker}",
+                            'tick_created': self.last_tick
+                        })
+
+                        self.positions.append({
+                            'ticker': ticker,
+                            'side': direction,
+                            'qty': 10,
+                            'entry_price': price,
+                            'confidence': confidence,
+                            'tick_entered': self.last_tick,
+                            'storage_leased': 1 if direction == 'BUY' else 0
+                        })
+                        available_lots -= 1
+
                 self.processed_headlines.add(headline)
 
     def _parse_eia_report(self, headline):
@@ -166,7 +180,7 @@ class FundamentalModel:
                     count = 0
                     for lease in leases:
                         if lease['ticker'] == 'CL-STORAGE' and count < pos['storage_leased']:
-                            self.pending_release_after_exit.append(lease['id'])
+                            self.lease_manager.unmark_reserved(lease['id'])
                             count += 1
             else:
                 remaining_positions.append(pos)
@@ -192,7 +206,7 @@ class FundamentalModel:
 
                 direction = 'BUY' if net_impact > 0 else 'SELL'
                 confidence = abs(net_impact)
-                qty = min(30, int(confidence * 100))
+                qty = min(50, int(confidence * 100))
 
                 prices = self.session.get_prices()
                 price = prices.get('CL') if direction == 'BUY' else prices.get('CL-2F')
@@ -305,6 +319,14 @@ class FundamentalModel:
             return -0.2
         elif 'PROTESTS' and 'VIOLENT' in headline:
             return -0.1
+        elif 'CHINA' and 'BUILDING' and 'ELECTRIC CARS' in headline:
+            return -0.2
+        elif 'OPEC' and 'MEETING' and 'BREAKS' in headline:
+            return -0.1
+        elif 'ITALIAN' and 'BOND YIELDS ADVANCE' in headline:
+            return 0.2
+        elif 'MILITANT' and 'ATTACK' in headline:
+            return 0.2
         return 0
 
     def best_trade(self):
@@ -336,3 +358,18 @@ class FundamentalModel:
             certainty = 0.95
 
         return expected_profit, certainty
+    
+    def get_cl_prediction(self, tick):
+        # Aggregate active CL deltas from EIA, pipeline, and news
+        forecast = sum(delta['delta'] for delta in self.delta_projections if delta['ticker'] == 'CL' and delta['decay_tick'] > tick)
+
+        if forecast > 0.05:
+            return 'up'
+        elif forecast < -0.05:
+            return 'down'
+        else:
+            return 'hold'
+
+    def get_cl_forecast(self, tick):
+        active_deltas = [d for d in self.delta_projections if d['ticker'] == 'CL' and d['decay_tick'] > tick]
+        return sum(d['delta'] for d in active_deltas) if active_deltas else None

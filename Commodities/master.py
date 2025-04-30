@@ -26,17 +26,19 @@ class MasterController:
             }
         }
         self.lease_manager = lease_manager.LeaseManager(self.session)
+        self.hedge_manager = hedge_manager.HedgeManager(self.session)
+
+        self.fundamental_model = FundamentalModel(self.session, self.market_state, self.lease_manager)
 
         self.models = [
-            #FundamentalModel(self.session, self.market_state, self.lease_manager),
-            #StorageModel(self.session, self.lease_manager),
-            #TransportModel(self.session, self.market_state, self.lease_manager),
-            RefineryModel(self.session, self.lease_manager)
+            #self.fundamental_model,
+            StorageModel(self.session, self.lease_manager),
+            #TransportModel(self.session, self.market_state, self.lease_manager, self.fundamental_model.get_cl_prediction),
+            #RefineryModel(self.session, self.lease_manager, self.hedge_manager, self.fundamental_model.get_cl_forecast)
         ]
 
         self.hedge_manager = hedge_manager.HedgeManager(self.session)
         self.event_scheduler = event_scheduler.EventScheduler()
-
         self.sleep_time = sleep_time
 
     def run(self):
